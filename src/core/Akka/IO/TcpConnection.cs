@@ -80,6 +80,9 @@ namespace Akka.IO
             ShutdownRequested = 1 << 4
         }
 
+        private static readonly TimeSpan writeRetryDelay = TimeSpan.FromMilliseconds(50);
+        private bool writeToBeRetried;
+
         private ConnectionStatus status;
         protected readonly TcpExt Tcp;
         protected readonly Socket Socket;
@@ -300,6 +303,13 @@ namespace Akka.IO
                             if (IsWritePending) DoWrite(info);
                         }
                         return true;
+                    case WriteRetry _:
+                        writeToBeRetried = false;
+                        if (IsWritePending)
+                        {
+                            DoWrite(info);
+                        }
+                        return true;
                     case ResumeWriting _:
                         /*
                          * If more than one actor sends Writes then the first to send this
@@ -452,7 +462,13 @@ namespace Akka.IO
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void DoWrite(ConnectionInfo info)
         {
-            pendingWrite = pendingWrite.DoWrite(info);
+            var result = pendingWrite.DoWrite(info);
+            pendingWrite = result.PendingWrite;
+            if (result.RequiresRetry && writeToBeRetried == false)
+            {
+                Context.System.Scheduler.ScheduleTellOnce(writeRetryDelay, Self, WriteRetry.Instance, Self);
+                writeToBeRetried = true;
+            }
         }
 
         private void HandleClose(ConnectionInfo info, IActorRef closeCommander, ConnectionClosed closedEvent)
@@ -784,7 +800,7 @@ namespace Akka.IO
                 Ack = ack;
             }
 
-            public abstract PendingWrite DoWrite(ConnectionInfo info);
+            public abstract WriteResult DoWrite(ConnectionInfo info);
             public abstract void Release();
         }
 
@@ -792,7 +808,7 @@ namespace Akka.IO
         {
             public static readonly PendingWrite Instance = new EmptyPendingWrite();
             private EmptyPendingWrite() : base(ActorRefs.NoSender, NoAck.Instance) { }
-            public override PendingWrite DoWrite(ConnectionInfo info) => this;
+            public override WriteResult DoWrite(ConnectionInfo info) => WriteResult.SuccessEmptyResult;
 
             public override void Release() { }
         }
@@ -826,13 +842,41 @@ namespace Akka.IO
                 //hasData = this.remainingData.MoveNext();
             }
 
-            public override PendingWrite DoWrite(ConnectionInfo info)
+            public override WriteResult DoWrite(ConnectionInfo info)
             {
                 try
                 {
-                    PendingWrite WriteToChannel(ByteString data)
+                    WriteResult WriteToChannel(ByteString data)
                     {
-                        var bytesWritten = _connection.Socket.Send(data.Buffers);
+                        int bytesWritten;
+
+                        try
+                        {
+                            bytesWritten = _connection.Socket.Send(data.Buffers);
+                        }
+                        catch (SocketException exception)
+                        {
+                            if (exception.SocketErrorCode == SocketError.WouldBlock)
+                            {
+                                PendingWrite nextPendingWrite;
+
+                                if (data.Count == _buffer.Count)
+                                {
+                                    nextPendingWrite = this;
+                                }
+                                else
+                                {
+                                    nextPendingWrite = new PendingBufferWrite(_connection, _sendArgs, _self, Commander, data, Ack, _tail);
+                                }
+
+                                return new WriteResult(true, nextPendingWrite);
+                            }
+                            else
+                            {
+                                throw;
+                            }
+                        }
+
                         if (_connection.traceLogging)
                             _connection.Log.Debug("Wrote [{0}] bytes to channel", bytesWritten);
                         if (bytesWritten < data.Count)
@@ -844,7 +888,8 @@ namespace Akka.IO
                         {
                             if(Ack != NoAck.Instance) Commander.Tell(Ack);
                             Release();
-                            return _connection.CreatePendingWrite(Commander, _tail, info);
+                            var nextPendingWrite = _connection.CreatePendingWrite(Commander, _tail, info);
+                            return new WriteResult(false, nextPendingWrite);
                         }
                     }
 
@@ -854,11 +899,30 @@ namespace Akka.IO
                 catch (SocketException e)
                 {
                     _connection.HandleError(info.Handler, e);
-                    return this;
+                    return new WriteResult(false, this);
                 }
             }
 
             public override void Release() { }
+        }
+
+        private sealed class WriteRetry
+        {
+            public static readonly WriteRetry Instance = new WriteRetry();
+        }
+
+        private struct WriteResult
+        {
+            public static readonly WriteResult SuccessEmptyResult = new WriteResult(false, EmptyPendingWrite.Instance);
+
+            public bool RequiresRetry { get; }
+            public PendingWrite PendingWrite { get; }
+
+            public WriteResult(bool requiresRetry, PendingWrite pendingWrite)
+            {
+                RequiresRetry = requiresRetry;
+                PendingWrite = pendingWrite;
+            }
         }
     }
 }
